@@ -1,118 +1,114 @@
-import sounddevice as sd
+import soundcard as sc
+import soundfile as sf
 import numpy as np
-import websocket
-import json
-from transformers import MarianMTModel, MarianTokenizer
-import tkinter as tk
-from threading import Thread
+from whisper_online import FasterWhisperASR, OnlineASRProcessor
+from googletrans import Translator
+import threading
 import queue
+import pyaudio
+import wave
+import tkinter as tk
+from tkinter import ttk
 
-class RealtimeTranslator:
+class RealtimeMeetingTranslator:
     def __init__(self):
+        self.source_language = "es"  # Spanish
+        self.target_language = "en"  # English
+        self.asr = FasterWhisperASR(self.source_language, "large-v2")
+        self.online_asr = OnlineASRProcessor(self.asr)
+        self.translator = Translator()
+        
+        self.audio_queue = queue.Queue()
+        self.text_queue = queue.Queue()
+        
+        self.is_recording = False
+        self.speakers = self.list_speakers()
+        
+        self.setup_gui()
+
+    def list_speakers(self):
+        return sc.all_speakers()
+
+    def select_speaker(self):
+        speaker_window = tk.Toplevel(self.root)
+        speaker_window.title("Select Speaker")
+        
+        for i, speaker in enumerate(self.speakers):
+            btn = ttk.Button(speaker_window, text=speaker.name, 
+                             command=lambda s=speaker: self.set_speaker(s, speaker_window))
+            btn.pack(pady=5)
+
+    def set_speaker(self, speaker, window):
+        self.selected_speaker = speaker
+        self.speaker_label.config(text=f"Selected: {speaker.name}")
+        window.destroy()
+
+    def start_recording(self):
+        if not hasattr(self, 'selected_speaker'):
+            print("Please select a speaker first.")
+            return
+        
+        self.is_recording = True
+        threading.Thread(target=self.record_audio, daemon=True).start()
+        threading.Thread(target=self.process_audio, daemon=True).start()
+
+    def stop_recording(self):
+        self.is_recording = False
+
+    def record_audio(self):
+        CHUNK = 1024
+        FORMAT = pyaudio.paInt16
+        CHANNELS = 1
+        RATE = 16000
+
+        p = pyaudio.PyAudio()
+        stream = p.open(format=FORMAT,
+                        channels=CHANNELS,
+                        rate=RATE,
+                        input=True,
+                        frames_per_buffer=CHUNK)
+
+        while self.is_recording:
+            data = stream.read(CHUNK)
+            self.audio_queue.put(data)
+
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+
+    def process_audio(self):
+        while self.is_recording:
+            if not self.audio_queue.empty():
+                audio_chunk = self.audio_queue.get()
+                self.online_asr.insert_audio_chunk(audio_chunk)
+                output = self.online_asr.process_iter()
+                if output:
+                    translated = self.translator.translate(output, src=self.source_language, dest=self.target_language).text
+                    self.text_queue.put(translated)
+
+    def update_transcript(self):
+        while not self.text_queue.empty():
+            text = self.text_queue.get()
+            self.transcript.insert(tk.END, text + "\n")
+            self.transcript.see(tk.END)
+        self.root.after(100, self.update_transcript)
+
+    def setup_gui(self):
         self.root = tk.Tk()
         self.root.title("Realtime Meeting Translator")
-        
-        self.text_area = tk.Text(self.root, height=20, width=50)
-        self.text_area.pack(pady=10)
-        
-        self.start_button = tk.Button(self.root, text="Start Translation", command=self.start_translation)
-        self.start_button.pack(pady=5)
-        
-        self.stop_button = tk.Button(self.root, text="Stop Translation", command=self.stop_translation, state=tk.DISABLED)
-        self.stop_button.pack(pady=5)
-        
-        self.is_translating = False
-        self.audio_queue = queue.Queue()
 
-        # Get list of audio devices
-        self.input_devices = sd.query_devices()
+        self.speaker_label = ttk.Label(self.root, text="No speaker selected")
+        self.speaker_label.pack(pady=10)
 
-        # Create dropdown for input device selection
-        self.input_var = tk.StringVar(self.root)
-        self.input_var.set("Select Input Device")
-        self.input_dropdown = tk.OptionMenu(self.root, self.input_var, *[device['name'] for device in self.input_devices if device['max_input_channels'] > 0])
-        self.input_dropdown.pack(pady=5)
+        ttk.Button(self.root, text="Select Speaker", command=self.select_speaker).pack(pady=5)
+        ttk.Button(self.root, text="Start Recording", command=self.start_recording).pack(pady=5)
+        ttk.Button(self.root, text="Stop Recording", command=self.stop_recording).pack(pady=5)
 
-        # Load translation model
-        self.load_translation_model()
+        self.transcript = tk.Text(self.root, wrap=tk.WORD, width=50, height=20)
+        self.transcript.pack(pady=10)
 
-        # WebSocket setup
-        self.ws = None
-
-    def load_translation_model(self):
-        # Load MarianMT model for Spanish to English translation
-        self.translator_model = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-es-en")
-        self.translator_tokenizer = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-es-en")
-
-    def audio_callback(self, indata, frames, time, status):
-        if status:
-            print(status)
-        if self.ws and self.ws.sock and self.ws.sock.connected:
-            self.ws.send(indata.tobytes(), websocket.ABNF.OPCODE_BINARY)
-
-    def on_message(self, ws, message):
-        data = json.loads(message)
-        if 'text' in data:
-            transcription = data['text']
-            
-            # Perform translation
-            inputs = self.translator_tokenizer(transcription, return_tensors="pt")
-            outputs = self.translator_model.generate(**inputs)
-            translation = self.translator_tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-            # Display results
-            self.text_area.insert(tk.END, f"Spanish: {transcription}\nEnglish: {translation}\n\n")
-            self.text_area.see(tk.END)
-
-    def on_error(self, ws, error):
-        print(f"Error: {error}")
-
-    def on_close(self, ws, close_status_code, close_msg):
-        print("WebSocket connection closed")
-
-    def on_open(self, ws):
-        print("WebSocket connection opened")
-
-    def start_translation(self):
-        input_device = next((device for device in self.input_devices if device['name'] == self.input_var.get()), None)
-
-        if not input_device:
-            print("Please select an input device")
-            return
-
-        self.is_translating = True
-        self.start_button.config(state=tk.DISABLED)
-        self.stop_button.config(state=tk.NORMAL)
-
-        # Connect to WhisperLive WebSocket
-        self.ws = websocket.WebSocketApp("ws://localhost:9090/",
-                                         on_message=self.on_message,
-                                         on_error=self.on_error,
-                                         on_close=self.on_close,
-                                         on_open=self.on_open)
-        Thread(target=self.ws.run_forever).start()
-
-        self.stream = sd.InputStream(
-            device=int(input_device['index']),
-            samplerate=16000,
-            channels=1,
-            callback=self.audio_callback)
-
-        self.stream.start()
-
-    def stop_translation(self):
-        self.is_translating = False
-        self.start_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
-        if hasattr(self, 'stream'):
-            self.stream.stop()
-            self.stream.close()
-        if self.ws:
-            self.ws.close()
-
-    def run(self):
+        self.root.after(100, self.update_transcript)
         self.root.mainloop()
 
 if __name__ == "__main__":
-    app = RealtimeTranslator()
-    app.run()
+    app = RealtimeMeetingTranslator()
